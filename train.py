@@ -1,16 +1,16 @@
-# train.py
 import torch
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-from TimeBERT_pretrain import TimesBERTForSeismic
-from dataloader import prepare_dataloader_from_npz
+from TimeBERT_pretrain import TimesBERTForSeismic, SeismicDataset
+# 請確保 CWA_dataloader 模組中有 create_dataloaders_7_2_1 與 load_test_dataloader 函數
+from CWA_dataloader import create_dataloaders_7_2_1, load_test_dataloader
 
 def train_model(model, train_loader, val_loader, device, num_epochs=100, lr=1e-4):
     model = model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     model.train()
 
-    # 用於紀錄各個 epoch 的損失
+    # 用於記錄各個 epoch 的損失
     epoch_total_loss = []
     epoch_mpm_loss = []
     epoch_var_loss = []
@@ -26,14 +26,17 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, lr=1e-4
         total_var_loss = 0
         total_dom_loss = 0
 
+        # 遍歷訓練集
         for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}"):
+            # 從 batch 中取得各個必要的輸入（請確保 dataloader 回傳的字典包含這些鍵）
             waveform = batch['waveform'].to(device)
+            waveform_var = batch['waveform_var'].to(device)
             domain_id = batch['domain_id'].to(device)
             var_mask = batch['var_mask'].to(device)
             mpm_mask = batch['mpm_mask'].to(device)
-            waveform_var = batch['waveform_var'].to(device)
 
             optimizer.zero_grad()
+            # 模型返回總損失與各部分損失： mpm_loss, var_loss, dom_loss
             loss, mpm_loss, var_loss, dom_loss = model(waveform, waveform_var, domain_id, var_mask, mpm_mask)
             loss.backward()
             optimizer.step()
@@ -55,7 +58,7 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, lr=1e-4
         epoch_dom_loss.append(avg_dom_loss)
         print(f"✅ Epoch {epoch+1} - Avg Total Loss: {avg_loss:.4f} | MPM: {avg_mpm_loss:.4f}, VAR: {avg_var_loss:.4f}, DOM: {avg_dom_loss:.4f}")
 
-        # Evaluate on validation set
+        # Evaluate on validation set at the end of each epoch
         val_loss, val_mpm, val_var, val_dom = evaluate_model(model, val_loader, device)
         print(f"🔍 Val   - Avg Loss: {val_loss:.4f} | MPM: {val_mpm:.4f}, VAR: {val_var:.4f}, DOM: {val_dom:.4f}")
 
@@ -105,24 +108,28 @@ def evaluate_model(model, dataloader, device):
 
     model.train()
     num_batches = len(dataloader)
-    return (
-        total_loss / num_batches,
-        total_mpm / num_batches,
-        total_var / num_batches,
-        total_dom / num_batches
-    )
+    return (total_loss / num_batches, total_mpm / num_batches,
+            total_var / num_batches, total_dom / num_batches)
 
 if __name__ == '__main__':
-    # 選擇運行設備（若有 GPU 則使用 cuda）
+    # 使用 GPU（若有可用的話）
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    # 從 npz 檔案中準備資料 DataLoader
-    train_loader, val_loader, test_loader = prepare_dataloader_from_npz(
-        "stead_combined_chunks.npz", batch_size=32, train_ratio=0.7, val_ratio=0.1
-    )
+
+    # 使用修改過的 create_dataloaders_7_2_1 取得訓練、測試與驗證的 DataLoader
+    metadata_path = "CWA_processed_data/all_metadata.csv"
+    hdf5_path = "CWA_processed_data/all.hdf5"
+    (train_wave, train_meta), (test_wave, test_meta), (val_wave, val_meta) = create_seismic_datasets_7_2_1(hdf5_path, metadata_csv)
+
+    train_dataset = SeismicDataset(train_wave, train_meta)
+    test_dataset = SeismicDataset(test_wave, test_meta)
+    val_dataset = SeismicDataset(val_wave, val_meta)
+
     # 載入模型
     model = TimesBERTForSeismic()
+
     # 執行訓練
-    train_model(model, train_loader, val_loader, device, num_epochs=100, lr=1e-4)
-    # 訓練完成後用測試集做最終評估
-    test_loss, test_mpm, test_var, test_dom = evaluate_model(model, test_loader, device)
+    train_model(model, train_dataset, val_dataset, device, num_epochs=100, lr=1e-4)
+
+    # 最終使用測試集做評估
+    test_loss, test_mpm, test_var, test_dom = evaluate_model(model, test_dataset, device)
     print(f"🧪 Final Test Performance - Loss: {test_loss:.4f}, MPM: {test_mpm:.4f}, VAR: {test_var:.4f}, DOM: {test_dom:.4f}")
