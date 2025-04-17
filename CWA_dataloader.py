@@ -6,7 +6,7 @@ import pandas as pd
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
-
+from tqdm import tqdm
 
 class CWADataset(Dataset):
     def __init__(self, hdf5_path, metadata, transform=None):
@@ -94,9 +94,39 @@ class CWADataset(Dataset):
 
 
 
-def extract_waveforms_from_hdf5(hdf5_path, metadata_df, pre_sec=5, post_sec=25, fs=100):
+def extract_waveforms_from_hdf5(hdf5_path, metadata_df):
+    """
+    根據 metadata 中的 trace_name 從 HDF5 中提取 P-wave 附近的波形區段
+    - input: metadata_df - 包含 trace_name 和 p_arrival 資訊的 DataFrame
+    - return: (N, 3, 3000) 的 waveform_array, 和 metadata_array
+    """
+
     waveforms = []
     metadata_records = []
+    pre_sec=5
+    post_sec=25
+    fs=100
+    candidate_columns = [
+        "station_code",
+        "trace_pga_cmps2",
+        "station_latitude_deg",
+        "station_longitude_deg",
+        "source_latitude_deg",
+        "source_longitude_deg",
+        "source_depth_km",
+        "path_ep_distance_km"
+    ]
+    selected_columns = [col for col in candidate_columns if col in metadata_df.columns]
+
+    numeric_cols = {
+        "trace_pga_cmps2",
+        "station_latitude_deg",
+        "station_longitude_deg",
+        "source_latitude_deg",
+        "source_longitude_deg",
+        "source_depth_km",
+        "path_ep_distance_km"
+    }
 
     with h5py.File(hdf5_path, 'r') as h5:
         for _, row in tqdm(metadata_df.iterrows(), total=len(metadata_df)):
@@ -117,13 +147,19 @@ def extract_waveforms_from_hdf5(hdf5_path, metadata_df, pre_sec=5, post_sec=25, 
             waveform = data[:, start:end]
             if waveform.shape[1] == (pre_sec + post_sec) * fs:
                 waveforms.append(waveform)
-                metadata_records.append(row.values)
-
+                values = []
+                for col in selected_columns:
+                    val = row[col]
+                    if col in numeric_cols:
+                        values.append(np.float32(val))
+                    else:
+                        values.append(val)
+                metadata_records.append(values)
     if not waveforms:
         raise RuntimeError("No valid waveforms extracted.")
 
     waveform_array = np.stack(waveforms, axis=0)
-    metadata_array = np.stack(metadata_records, axis=0).astype(np.float32)
+    metadata_array = pd.DataFrame(metadata_records, columns=selected_columns)
     return waveform_array, metadata_array
 
 
@@ -167,12 +203,12 @@ def create_dataloaders_7_2_1(hdf5_path, metadata_csv, batch_size=32, random_seed
     test_df = df.loc[test_idx].reset_index(drop=True)
     val_df = df.loc[val_idx].reset_index(drop=True)
 
-     print("\n📦 Extracting training waveforms")
-    train_wave, train_meta = extract_waveforms_from_hdf5(hdf5_path, train_df, pre_sec, post_sec, fs)
+    print("\n📦 Extracting training waveforms")
+    train_wave, train_meta = extract_waveforms_from_hdf5(hdf5_path, train_df)
     print("📦 Extracting testing waveforms")
-    test_wave, test_meta = extract_waveforms_from_hdf5(hdf5_path, test_df, pre_sec, post_sec, fs)
+    test_wave, test_meta = extract_waveforms_from_hdf5(hdf5_path, test_df)
     print("📦 Extracting validation waveforms")
-    val_wave, val_meta = extract_waveforms_from_hdf5(hdf5_path, val_df, pre_sec, post_sec, fs)
+    val_wave, val_meta = extract_waveforms_from_hdf5(hdf5_path, val_df)
 
     return (train_wave, train_meta), (test_wave, test_meta), (val_wave, val_meta)
     # # 波形資料
@@ -213,25 +249,6 @@ def create_dataloaders_7_2_1(hdf5_path, metadata_csv, batch_size=32, random_seed
     #     f"測試集 {len(test_dataset)} 筆，驗證集 {len(val_dataset)} 筆"
     # )
     # return train_loader, test_loader, val_loader
-
-
-def load_test_dataloader(hdf5_path, metadata_csv, batch_size=32):
-    """
-    直接載入測試用 DataLoader，不做分割
-    """
-    df = pd.read_csv(metadata_csv)
-    df = df[
-        (df["station_location_code"] == 10) &
-        (df["trace_snr_db"] >= 10) &
-        (df["trace_p_arrival_sample"] >= 500) &
-        (df["trace_channel"].isin(["HN", "HL"])) &
-        (df["path_ep_distance_km"] <= 100) &
-        (df["trace_completeness"] >= 3)
-    ]
-    dataset = CWADataset(hdf5_path, df)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
-    print(f"🧪 測試集載入完成，共 {len(dataset)} 筆")
-    return dataloader
 
 
 def show_class_distribution(dataset, name="Dataset"):
@@ -303,7 +320,7 @@ def plot_sample_waveform(dataset, idx=0, fs=100, save_path = None):
     對於 100 Hz 的數據，此範圍大約代表 3 秒
     """
     # 取得數據集中的第 idx 筆數據
-    waveform, label = dataset[idx]  
+    waveform = dataset[idx]  
     # 將 tensor 轉為 numpy 陣列，形狀應為 (3, samples)
     waveform_np = waveform.numpy()
     samples = waveform_np.shape[1]
@@ -322,7 +339,7 @@ def plot_sample_waveform(dataset, idx=0, fs=100, save_path = None):
         axs[i].grid(True)
     
     axs[-1].set_xlabel("Time (s)")
-    plt.suptitle(f"Extracted Waveform (Label {label.item()})", fontsize=16)
+    plt.suptitle(f"Extracted Waveform ", fontsize=16)
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     # plt.show()
     # 如果指定了 save_path，則存檔；否則顯示圖像
@@ -337,20 +354,33 @@ def plot_sample_waveform(dataset, idx=0, fs=100, save_path = None):
         plt.show()
     plt.close()
 
+def get_num_domains(metadata_csv):
+    df = pd.read_csv(metadata_csv)
+    df = df[
+        (df["station_location_code"] == 10) &
+        (df["trace_snr_db"] >= 10) &
+        (df["trace_p_arrival_sample"] >= 500) &
+        (df["trace_channel"].isin(["HN", "HL"])) &
+        (df["path_ep_distance_km"] <= 100) &
+        (df["trace_completeness"] >= 3)
+    ]
+    
+    if "station_code" in df.columns:
+        station_ids = df["station_code"]
+    elif "station_latitude_deg" in df.columns and "station_longitude_deg" in df.columns:
+        station_ids = df["receiver_latitude"].astype(str) + "_" + df["receiver_longitude"].astype(str)
+    else:
+        raise ValueError("找不到 station_code 或經緯度欄位")
+
+    return station_ids.nunique()
+
 if __name__ == "__main__":
     metadata_path = "CWA_processed_data/all_metadata.csv"
     hdf5_path = "CWA_processed_data/all.hdf5"
 
     # 使用 create_dataloaders_7_2_1 分割成訓練、測試與驗證集（比例 7:2:1）
-    train_loader, test_loader, val_loader = create_dataloaders_7_2_1(
-        hdf5_path, metadata_path, batch_size=32
-    )
-
-    # 印出各資料集大小（可從 DataLoader.dataset 獲得）
-    print(f"訓練集大小: {len(train_loader.dataset)}")
-    print(f"測試集大小: {len(test_loader.dataset)}")
-    print(f"驗證集大小: {len(val_loader.dataset)}")
+    (train_wave, train_meta), (test_wave, test_meta), (val_wave, val_meta) = create_dataloaders_7_2_1(hdf5_path, metadata_path)
 
     # 調用上面定義的繪圖函數，顯示索引 0 的波形
     save_path = "plot/sample_waveform.png"
-    plot_sample_waveform(train_loader.dataset, idx=0, fs=100, save_path = save_path)
+    plot_sample_waveform(train_wave, idx=0, fs=100, save_path = save_path)
