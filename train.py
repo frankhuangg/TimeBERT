@@ -3,7 +3,8 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 from TimeBERT_pretrain import TimesBERTForSeismic, SeismicDataset
 # 請確保 CWA_dataloader 模組中有 create_dataloaders_7_2_1 與 load_test_dataloader 函數
-from CWA_dataloader import create_dataloaders_7_2_1, load_test_dataloader
+from CWA_dataloader import create_dataloaders_7_2_1, get_num_domains
+from torch.utils.data import Dataset, DataLoader
 
 def train_model(model, train_loader, val_loader, device, num_epochs=100, lr=1e-4):
     model = model.to(device)
@@ -111,25 +112,43 @@ def evaluate_model(model, dataloader, device):
     return (total_loss / num_batches, total_mpm / num_batches,
             total_var / num_batches, total_dom / num_batches)
 
+def collate_fn_dict(batch):
+    collated = {}
+    for key in batch[0]:
+        values = [d[key] for d in batch]
+        if isinstance(values[0], torch.Tensor):
+            collated[key] = torch.stack(values)
+        else:
+            collated[key] = values  # 保留 list of str 或其他非 tensor 類型
+    return collated
+
+
 if __name__ == '__main__':
+    batch_size = 32
+
     # 使用 GPU（若有可用的話）
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # 使用修改過的 create_dataloaders_7_2_1 取得訓練、測試與驗證的 DataLoader
     metadata_path = "CWA_processed_data/all_metadata.csv"
     hdf5_path = "CWA_processed_data/all.hdf5"
-    (train_wave, train_meta), (test_wave, test_meta), (val_wave, val_meta) = create_seismic_datasets_7_2_1(hdf5_path, metadata_csv)
+    (train_wave, train_meta), (test_wave, test_meta), (val_wave, val_meta) = create_dataloaders_7_2_1(hdf5_path, metadata_path)
 
     train_dataset = SeismicDataset(train_wave, train_meta)
     test_dataset = SeismicDataset(test_wave, test_meta)
     val_dataset = SeismicDataset(val_wave, val_meta)
 
+    train_loader = DataLoader(train_dataset, batch_size = batch_size, shuffle = True, collate_fn=collate_fn_dict)
+    test_loader = DataLoader(test_dataset, batch_size = batch_size, shuffle = False, collate_fn=collate_fn_dict)
+    val_loader = DataLoader(val_dataset, batch_size = batch_size, shuffle = False, collate_fn=collate_fn_dict)
+    
+    num_domains = get_num_domains(metadata_path)
     # 載入模型
-    model = TimesBERTForSeismic()
+    model = TimesBERTForSeismic(patch_size=100, embed_dim=768, num_domains = num_domains)
 
     # 執行訓練
-    train_model(model, train_dataset, val_dataset, device, num_epochs=100, lr=1e-4)
+    train_model(model, train_loader, val_loader, device, num_epochs=100, lr=1e-4)
 
     # 最終使用測試集做評估
-    test_loss, test_mpm, test_var, test_dom = evaluate_model(model, test_dataset, device)
+    test_loss, test_mpm, test_var, test_dom = evaluate_model(model, test_loader, device)
     print(f"🧪 Final Test Performance - Loss: {test_loss:.4f}, MPM: {test_mpm:.4f}, VAR: {test_var:.4f}, DOM: {test_dom:.4f}")
