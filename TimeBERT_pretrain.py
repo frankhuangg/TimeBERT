@@ -18,6 +18,7 @@ class SeismicDataset(Dataset):
         self.patch_size = patch_size
         self.mask_ratio = mask_ratio
         self.domain_ids = self.le.fit_transform(self.metadata['station_code'])  # 根據Station Code，組合成站點
+        self.pga = metadata['trace_pga_cmps2'].values.astype('float32')
 
         # 可以檢查生成的 domain_id 範圍是否符合要求（此處檢查最大值是否小於 100）
         # print("Domain id range:", self.domain_ids.min(), self.domain_ids.max())
@@ -32,13 +33,14 @@ class SeismicDataset(Dataset):
         waveform = self.waveforms[idx].copy()  # 取得一筆波形資料，形狀 (3, T)
         waveform = torch.tensor(waveform, dtype=torch.float32)
         # # --- 加入標準化處理 --- #
-        # # 針對每個 channel 計算均值與標準差（沿時間軸 T）
-        # mean = waveform.mean(dim=1, keepdim=True)
-        # std = waveform.std(dim=1, keepdim=True) + 1e-5  # 加入 epsilon 防止除以 0
-        # waveform = (waveform - mean) / std
+        # 針對每個 channel 計算均值與標準差（沿時間軸 T）
+        mean = waveform.mean(dim=1, keepdim=True)
+        std = waveform.std(dim=1, keepdim=True) + 1e-5  # 加入 epsilon 防止除以 0
+        waveform = (waveform - mean) / std
         # ------------------------ #
         domain_id = torch.tensor(self.domain_ids[idx], dtype=torch.long)        # 對應的 domain_id
         C, T = waveform.shape
+        pga = torch.tensor(self.pga[idx], dtype=torch.float32)
 
         # 替換的變量會影響到其他任務
 
@@ -60,7 +62,7 @@ class SeismicDataset(Dataset):
         waveform_for_var[replace_idx] = torch.tensor(self.waveforms[other_idx][replace_idx], dtype=torch.float32)
         var_mask[replace_idx] = 1
 
-        # 假設替換完後，只重新標準化被替換的 channel
+        # # 假設替換完後，只重新標準化被替換的 channel
         # channel_data = waveform_for_var[replace_idx]
         # channel_mean = channel_data.mean()
         # channel_std = channel_data.std() + 1e-5
@@ -74,7 +76,8 @@ class SeismicDataset(Dataset):
             'waveform_var': waveform_for_var,     # 替換後 → VAR 任務專用
             'domain_id': domain_id,
             'var_mask': var_mask,
-            'mpm_mask': mpm_mask
+            'mpm_mask': mpm_mask,
+            'pga': pga
         }
 
 class PatchEmbedding(nn.Module):
@@ -165,7 +168,7 @@ class FTPHead(nn.Module):
         return loss_var + loss_dom, loss_var, loss_dom
 
 class TimesBERTForSeismic(nn.Module):
-    def __init__(self, patch_size=100, embed_dim=768, num_domains=1000):
+    def __init__(self, patch_size=100, embed_dim=768, num_domains=1000, loss_weights=(1.0, 2.0, 5.0)):
         """
         patch_size: 每個 patch 的大小
         embed_dim: token 嵌入的維度
@@ -178,6 +181,7 @@ class TimesBERTForSeismic(nn.Module):
         self.ftp = FTPHead(embed_dim, num_domains)
         # 為 MPM (Masked Patch Modeling) 建立投影頭，將編碼器輸出投影回原始 patch 大小
         self.projection_head = nn.Linear(embed_dim, patch_size)
+        self.loss_weights = loss_weights  # (lambda_mpm, lambda_var, lambda_dom)
 
     def forward(self, waveform, waveform_var, domain_ids, var_mask, mpm_mask):
         """
@@ -194,7 +198,12 @@ class TimesBERTForSeismic(nn.Module):
         # 對 tokens 做遮蔽（MPM）：將被遮蔽的 tokens 設為 0
         tokens_masked = tokens.clone()
         mask_expanded = mpm_mask.unsqueeze(-1).expand_as(tokens_masked)
-        tokens_masked[mask_expanded] = 0
+        
+        # mask_token = 0
+        # tokens_masked[mask_expanded] = 0
+
+        # mask_token = 可學習參數
+        tokens_masked[mask_expanded] = self.embedding.mask_token.expand_as(tokens_masked[mask_expanded])
 
         # 組合所有 tokens：先放入 DOM token，再加入所有 patch token，最後加入 VAR token
         all_tokens = torch.cat([
@@ -238,5 +247,7 @@ class TimesBERTForSeismic(nn.Module):
             mpm_loss = torch.tensor(0.0, device=waveform.device)
 
         ftp_loss, loss_var, loss_dom = self.ftp(z_var, z_dom, var_mask, domain_ids)
+        lambda_mpm, lambda_var, lambda_dom = self.loss_weights
+        total_loss = lambda_mpm * mpm_loss + lambda_var * loss_var + lambda_dom * loss_dom
 
-        return mpm_loss + ftp_loss, mpm_loss, loss_var, loss_dom
+        return total_loss, lambda_mpm * mpm_loss, lambda_var * loss_var, lambda_dom * loss_dom
