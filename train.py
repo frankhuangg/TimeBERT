@@ -2,7 +2,6 @@ import torch
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from TimeBERT_pretrain import TimesBERTForSeismic, SeismicDataset
-# 請確保 CWA_dataloader 模組中有 create_dataloaders_7_2_1 與 load_test_dataloader 函數
 from CWA_dataloader import create_dataloaders_7_2_1, get_num_domains
 from torch.utils.data import Dataset, DataLoader
 
@@ -10,6 +9,12 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, lr=1e-4
     model = model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     model.train()
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
+
+    best_val_loss = float('inf')
+    patience_counter = 0
+    early_stop_patience = 10
+
 
     # 用於記錄各個 epoch 的損失
     epoch_total_loss = []
@@ -68,23 +73,60 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, lr=1e-4
         val_var_loss.append(val_var)
         val_dom_loss.append(val_dom)
 
+        scheduler.step(val_loss)
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), "pretrained_timesbert_best.pt")
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= early_stop_patience:
+                print(f"⏹️ Early stopping at epoch {epoch+1} (no improvement for {early_stop_patience} epochs)")
+                break
+
     # 繪製訓練與驗證損失曲線
-    epochs = range(1, num_epochs + 1)
-    plt.figure(figsize=(12, 8))
-    plt.plot(epochs, epoch_total_loss, marker='o', label='Train Total Loss')
-    plt.plot(epochs, val_total_loss, marker='x', label='Val Total Loss')
+    epochs = range(1, len(epoch_total_loss) + 1)
+    # Plot individual loss curves
+    plt.figure()
     plt.plot(epochs, epoch_mpm_loss, marker='o', label='Train MPM Loss')
     plt.plot(epochs, val_mpm_loss, marker='x', label='Val MPM Loss')
+    plt.xlabel("Epoch")
+    plt.ylabel("MPM Loss")
+    plt.title("MPM Loss Curve")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig("loss_curve_mpm.png")
+
+    plt.figure()
     plt.plot(epochs, epoch_var_loss, marker='o', label='Train VAR Loss')
     plt.plot(epochs, val_var_loss, marker='x', label='Val VAR Loss')
+    plt.xlabel("Epoch")
+    plt.ylabel("VAR Loss")
+    plt.title("VAR Loss Curve")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig("loss_curve_var.png")
+
+    plt.figure()
     plt.plot(epochs, epoch_dom_loss, marker='o', label='Train DOM Loss')
     plt.plot(epochs, val_dom_loss, marker='x', label='Val DOM Loss')
     plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.title("Training vs. Validation Loss Curves")
+    plt.ylabel("DOM Loss")
+    plt.title("DOM Loss Curve")
     plt.legend()
     plt.grid(True)
-    plt.show()
+    plt.savefig("loss_curve_dom.png")
+
+    plt.figure()
+    plt.plot(epochs, epoch_total_loss, marker='o', label='Train Total Loss')
+    plt.plot(epochs, val_total_loss, marker='x', label='Val Total Loss')
+    plt.xlabel("Epoch")
+    plt.ylabel("Total Loss")
+    plt.title("Total Loss Curve")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig("loss_curve_total.png")
 
 def evaluate_model(model, dataloader, device):
     model.eval()
@@ -152,3 +194,6 @@ if __name__ == '__main__':
     # 最終使用測試集做評估
     test_loss, test_mpm, test_var, test_dom = evaluate_model(model, test_loader, device)
     print(f"🧪 Final Test Performance - Loss: {test_loss:.4f}, MPM: {test_mpm:.4f}, VAR: {test_var:.4f}, DOM: {test_dom:.4f}")
+    # —— 儲存預訓練模型 —— 
+    torch.save(model.state_dict(), "pretrained_timesbert.pt")
+    print("✅ Saved pretrained model to pretrained_timesbert.pt")
